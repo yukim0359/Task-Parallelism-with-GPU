@@ -1,0 +1,2 @@
+Fibonacci(18) = 2584
+Kernel execution time: 15.182 ms (0.015182 s)

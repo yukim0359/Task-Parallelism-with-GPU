@@ -1,11 +1,14 @@
+// GPU上でfork-joinを実行する
+
 #include <cuda_runtime.h>
 #include <stdio.h>
 
-#define MAX_TASKS       4096   // 生成されるタスクの上限
-#define QUEUE_SIZE      4096   // タスクキューのサイズ
+#define MAX_TASKS       16384   // 生成されるタスクの上限
+#define MAX_TASKS_PER_BLOCK 512 // ブロック内でのタスクの最大数
+#define QUEUE_SIZE      8192   // タスクキューのサイズ
 #define MAX_CHILD_TASKS 32     // 子タスクの最大数
-#define STACK_SIZE      4      // 1タスクあたりのスタック領域のサイズ（バイト単位）
-#define NUM_BLOCKS      1024   // ブロック数
+#define STACK_SIZE      4      // 1タスクあたりのスタック領域のサイズ
+#define NUM_BLOCKS      128    // ブロック数
 #define THREADS_PER_BLK 128    // ブロック内のスレッド数
 #define DATA_LENGTH     1000   // ブロック内で共有するデータのサイズ，重い操作のためのデータ
 
@@ -19,14 +22,14 @@ enum State : int {
 struct Task {
     int   parentId;                        // 親タスク ID
     int   child_ids[MAX_CHILD_TASKS];      // 子タスクのIDたち
-    /* TODO: MAX_CHILD_TASKSを撤廃して動的配列に「できない？Task[]を宣言しているから現状厳しい */
+    /* TODO: MAX_CHILD_TASKSを撤廃して動的配列にできない？Task[]を宣言しているから現状厳しい */
     int   joinCount;                       // 子タスク残数
     int   n;                               // フィボナッチ数列のn
     /* TODO: nを渡すような形ではなく，関数を渡すような形にできる？一般のTask構造体が何を持ってるか調べないといけない */
     State state;                           // どのステージにいるか，たとえば同期1後のタスクはSTATE_AFTER_CHILD1にいる
     /* TODO: 以下2つは未実装 */
-    int   stack[STACK_SIZE];               // スタック領域，join後に使う変数を保存する
-    int   sp;                              // stack[] の中でのトップオフセット
+    // int   stack[STACK_SIZE];               // スタック領域，join後に使う変数を保存する
+    // int   sp;                              // stack[] の中でのトップオフセット
 };
 
 // グローバル領域
@@ -104,14 +107,84 @@ __device__ void notifyParent(int parentId) {
 
 // ブロック内の全スレッドで協調して重い操作を行う例
 __device__ void heavy_operation() {
-    int sdata[DATA_LENGTH]; // ここはshared memoryも使える
+    __shared__ int sdata[DATA_LENGTH]; // ここはshared memoryも使える
     for (int i = threadIdx.x; i < DATA_LENGTH; i += blockDim.x) {
         sdata[i] = i;
     }
-    // if (threadIdx.x == 0) {
-    //     printf("heavy_operation\n");
-    // }
 }
+
+// タスクを実行する関数
+__device__ void TaskFunction(Task t, int shared_tid) {
+    if (t.n < 2) {
+        heavy_operation();
+        d_results[shared_tid] = t.n;  // 結果をd_resultsに保存
+        if (threadIdx.x == 0) {
+            notifyParent(t.parentId);
+            atomicSub(&d_pendingTasks, 1);
+        }
+    } else {
+        switch (t.state) {
+            case STATE_START: {
+                if (threadIdx.x == 0) {
+                    int child1_id = atomicAdd(&d_taskId, 2);
+                    // 子タスク1のIDチェック
+                    if (child1_id >= MAX_TASKS) {
+                        printf("FATAL ERROR: Task limit exceeded after child1 creation (ID: %d, MAX: %d)\n", 
+                               child1_id, MAX_TASKS);
+                        __trap();
+                    }
+                    Task child1;
+                    child1.parentId = shared_tid;
+                    child1.state = STATE_START;
+                    child1.joinCount = 0;
+                    child1.n = t.n - 1;
+                    Task child2;
+                    child2.parentId = shared_tid;
+                    child2.state = STATE_START;
+                    child2.joinCount = 0;
+                    child2.n = t.n - 2;
+                    d_tasks[child1_id] = child1;
+                    d_tasks[child1_id + 1] = child2;
+
+                    // 親タスクの情報を更新
+                    // これを子タスクをキューに追加する前にやらないと，子タスクが未更新の親タスクを実行してしまう可能性がある
+                    d_tasks[shared_tid].joinCount = 2;
+                    d_tasks[shared_tid].state = STATE_AFTER_CHILD1;
+                    d_tasks[shared_tid].child_ids[0] = child1_id;
+                    d_tasks[shared_tid].child_ids[1] = child1_id + 1;
+
+                    // 子タスクをキューに追加
+                    enqueue(child1_id);
+                    enqueue(child1_id + 1);
+                }
+                break;
+            }
+            case STATE_AFTER_CHILD1: {
+                // ここでjoinする
+                // 子タスクの結果を取得
+                if (threadIdx.x == 0) {
+                    int child1_result = d_results[t.child_ids[0]];
+                    int child2_result = d_results[t.child_ids[1]];
+                    d_results[shared_tid] = child1_result + child2_result;
+                }
+                heavy_operation();
+                if (threadIdx.x == 0) {
+                    notifyParent(t.parentId);
+                    atomicSub(&d_pendingTasks, 1);
+                }
+                break;
+            }
+            default: {
+                break;
+            }
+        }
+    }
+}
+
+// __device__ bool steal(int &tid_tmp) {
+//     // ここでstealする
+//     return false;
+// }
 
 __global__ void persistentKernel() {
     __shared__ int shared_tid; // ブロック内で共有するタスクID
@@ -131,68 +204,8 @@ __global__ void persistentKernel() {
         if (shared_tid == -1) continue;
 
         Task t = d_tasks[shared_tid];
-        switch (t.state) {
-            case STATE_START: {
-                if (t.n < 2) {
-                    heavy_operation();
-                    d_results[shared_tid] = t.n;  // 結果をd_resultsに保存
-                    // notifyParentしたうえでタスクを終了する
-                    if (threadIdx.x == 0) {
-                        notifyParent(t.parentId);
-                        atomicSub(&d_pendingTasks, 1);
-                    }
-                } else {
-                    if (threadIdx.x == 0) {
-                        // ここでforkする
-                        int child1_id = atomicAdd(&d_taskId, 2);
-                        Task child1;
-                        child1.parentId = shared_tid;
-                        child1.state = STATE_START;
-                        child1.joinCount = 0;
-                        child1.n = t.n - 1;
-                        child1.sp = 0;
-                        Task child2;
-                        child2.parentId = shared_tid;
-                        child2.state = STATE_START;
-                        child2.joinCount = 0;
-                        child2.n = t.n - 2;
-                        child2.sp = 0;
-                        d_tasks[child1_id] = child1;
-                        d_tasks[child1_id + 1] = child2;
-
-                        // 親タスクの情報を更新
-                        // これを子タスクをキューに追加する前にやらないと，子タスクが未更新の親タスクを実行してしまう可能性がある
-                        d_tasks[shared_tid].joinCount = 2;
-                        d_tasks[shared_tid].state = STATE_AFTER_CHILD1;
-                        d_tasks[shared_tid].child_ids[0] = child1_id;
-                        d_tasks[shared_tid].child_ids[1] = child1_id + 1;
-
-                        // 子タスクをキューに追加
-                        enqueue(child1_id);
-                        enqueue(child1_id + 1);
-                    }
-                }
-                break;
-            }
-
-            case STATE_AFTER_CHILD1: {
-                // ここでjoinする
-                // 子タスクの結果を取得
-                int child1_result = d_results[t.child_ids[0]];
-                int child2_result = d_results[t.child_ids[1]];
-                heavy_operation();
-                d_results[shared_tid] = child1_result + child2_result;
-                // notifyParentしたうえでタスクを終了する
-                if (threadIdx.x == 0) {
-                    notifyParent(t.parentId);  // どうせpendingTasksが0になったら終了するのでこれでもOK?
-                    /* NOTE: これはold implementation */
-                    // if(shared_tid != 0) notifyParent(t.parentId);
-                    atomicSub(&d_pendingTasks, 1);
-                }
-            }
-            break;
-        }
-        __syncthreads();
+        TaskFunction(t, shared_tid);
+        // __syncthreads();
     }
 }
 
@@ -214,9 +227,8 @@ int main() {
     Task initialTask;
     initialTask.parentId = 0;
     initialTask.joinCount = 0;
-    initialTask.n = 15;
+    initialTask.n = 18;
     initialTask.state = STATE_START;
-    initialTask.sp = 0;
 
     // デバイスメモリに初期タスクをコピー
     cudaStatus = cudaMemcpyToSymbol(d_tasks, &initialTask, sizeof(Task), 0);
@@ -226,7 +238,7 @@ int main() {
     }
 
     // グローバル変数の初期化
-    int initialValues[] = {0, 0, 1, 1};  // d_head, d_tail, d_pendingTasks, d_taskId
+    int initialValues[] = {0, 0, 0, 1};  // d_head, d_tail, d_pendingTasks, d_taskId
     cudaStatus = cudaMemcpyToSymbol(d_head, &initialValues[0], sizeof(int), 0);
     if (cudaStatus != cudaSuccess) { fprintf(stderr, "Global variable initialization failed! (d_head)\n"); return 1; }
     cudaStatus = cudaMemcpyToSymbol(d_tail, &initialValues[1], sizeof(int), 0);
@@ -243,8 +255,6 @@ int main() {
         fprintf(stderr, "Initial enqueue failed!");
         return 1;
     }
-
-    printf("Starting Fibonacci calculation for n = %d\n", initialTask.n);
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
